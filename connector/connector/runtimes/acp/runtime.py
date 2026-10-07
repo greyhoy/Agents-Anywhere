@@ -259,6 +259,17 @@ class AcpRuntime(AgentRuntime):
                     unavailable_reason=None if active else "no_active_turn",
                     metadata={"source": "acp.runtime"},
                 ),
+                RuntimeCapability(
+                    capability_id=CAPABILITY_SESSION_INTERACTION_APPROVAL,
+                    scope="session",
+                    runtime=ACP_RUNTIME,
+                    session_id=session_id,
+                    connector_id=self.host.connector_id,
+                    supported=True,
+                    available=True,
+                    unavailable_reason=None,
+                    metadata={"source": "acp.runtime"},
+                ),
             ),
             metadata={"source": "acp.runtime"},
         )
@@ -497,6 +508,14 @@ class AcpRuntime(AgentRuntime):
             )
         if action_id in {"approve", "approved", "accept", "allow"}:
             outcome = {"outcome": {"outcome": "selected", "optionId": "allow"}}
+        elif action_id in {"allow_once", "allow_session", "allow_always"}:
+            # Hermes permission options surface verbatim as action ids;
+            # map them onto the option Hermes actually offered.
+            outcome = {
+                "outcome": {"outcome": "selected", "optionId": action_id}
+            }
+        elif action_id in {"reject", "deny", "denied", "reject_once", "reject_always", "deny_once", "deny_always"}:
+            outcome = {"outcome": {"outcome": "rejected"}}
         elif input_data and isinstance(input_data.get("optionId"), str):
             outcome = {
                 "outcome": {
