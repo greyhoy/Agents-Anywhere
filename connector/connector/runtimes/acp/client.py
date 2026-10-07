@@ -73,7 +73,7 @@ class AcpClient:
             env=self.env,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.STDOUT,
             limit=MAX_FRAME_BYTES + 1,
         )
         self._reader_task = asyncio.create_task(
@@ -208,7 +208,14 @@ class AcpClient:
                 logger.warning("ACP agent process exited unexpectedly")
 
     def _handle_frame(self, line: bytes) -> None:
-        value = json.loads(line.decode("utf-8"))
+        text = line.decode("utf-8", errors="replace").strip()
+        if not text.startswith("{"):
+            # Some ACP agents (e.g. OpenClaw) print banners/warnings to
+            # stdout before the protocol starts. Skip non-JSON lines
+            # instead of killing the reader.
+            logger.debug("ACP agent emitted non-JSON line, skipping: %s", text[:120])
+            return
+        value = json.loads(text)
         if not isinstance(value, dict) or value.get("jsonrpc") != "2.0":
             raise RuntimeError("ACP agent emitted an invalid JSON-RPC frame")
         if "id" in value and "method" not in value:

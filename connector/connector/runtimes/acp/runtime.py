@@ -41,7 +41,7 @@ from connector.runtime_protocol.timeline import (
     ToolTimelineItem,
     timeline_content_hash,
 )
-from connector.runtimes.acp.client import AcpClient
+from connector.runtimes.acp.client import AcpClient, AcpRpcError
 
 ACP_RUNTIME = "acp"
 _SYNC_STATE_KEY = "acp.sessions"
@@ -59,6 +59,7 @@ class AcpSession:
     items: dict[str, RuntimeTimelineItem] = field(default_factory=dict)
     message_buffer: dict[str, list[str]] = field(default_factory=dict)
     thought_buffer: dict[str, list[str]] = field(default_factory=dict)
+    replaying: bool = False
 
 
 class AcpRuntime(AgentRuntime):
@@ -594,6 +595,45 @@ class AcpRuntime(AgentRuntime):
                 },
                 timeout=1800,
             )
+        except AcpRpcError as exc:
+            # Bridge restarts lose the in-memory ACP session; recover by
+            # re-loading the session (OpenClaw supports loadSession) and
+            # retrying the prompt once. The "not found" detail may live in
+            # message or data.details depending on the agent.
+            _exc_text = f"{exc.message} {exc.data if isinstance(exc.data, str) else ''}".lower()
+            if isinstance(exc.data, dict) and isinstance(exc.data.get("details"), str):
+                _exc_text += f" {exc.data['details']}".lower()
+            _not_found = "not found" in _exc_text
+            if _not_found and session.external_session_id:
+                # Suppress notification projection while the session/load
+                # replay streams history back — replayed chunks must not be
+                # appended to the live turn's message buffer.
+                session.replaying = True
+                try:
+                    await client.request(
+                        "session/load",
+                        {
+                            "sessionId": session.external_session_id,
+                            "cwd": session.cwd or self.cwd,
+                            "mcpServers": [],
+                        },
+                        timeout=60,
+                    )
+                finally:
+                    session.replaying = False
+                try:
+                    result = await client.request(
+                        "session/prompt",
+                        {
+                            "sessionId": session.external_session_id,
+                            "prompt": [{"type": "text", "text": content}],
+                        },
+                        timeout=1800,
+                    )
+                except Exception:
+                    raise exc
+            else:
+                raise
             stop_reason = str((result or {}).get("stopReason") or "end_turn")
             if stop_reason not in {"end_turn", "cancelled"}:
                 outcome = "failed"
@@ -677,6 +717,9 @@ class AcpRuntime(AgentRuntime):
             return
         session = self._sessions.get(platform_id)
         if session is None:
+            return
+        if session.replaying:
+            # History replay from session/load — not live turn output.
             return
         update = params.get("update") or {}
         if not isinstance(update, dict):
