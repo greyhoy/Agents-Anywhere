@@ -16,6 +16,7 @@ from connector.runtime_protocol import (
     CAPABILITY_SESSION_INTERACTION_APPROVAL,
     CAPABILITY_SESSION_INTERRUPT,
     CAPABILITY_SESSION_SEND_MESSAGE,
+    PreparedSessionTimelineSync,
     RuntimeAttachment,
     RuntimeCapability,
     RuntimeCapabilitySet,
@@ -60,6 +61,7 @@ class AcpSession:
     message_buffer: dict[str, list[str]] = field(default_factory=dict)
     thought_buffer: dict[str, list[str]] = field(default_factory=dict)
     replaying: bool = False
+    replay_turn_id: str | None = None
 
 
 class AcpRuntime(AgentRuntime):
@@ -329,7 +331,11 @@ class AcpRuntime(AgentRuntime):
                 external_session_id=external_session_id,
                 runtime=ACP_RUNTIME,
                 items=(),
-                complete=True,
+                # Never claim completeness for a session we know nothing
+                # about: a complete snapshot replaces (DELETEs) whatever the
+                # platform already holds, so an empty "complete" snapshot
+                # wipes stored history on every connector restart.
+                complete=False,
                 metadata={"source": "acp.runtime", "reason": "unknown_session"},
             )
         items = tuple(
@@ -342,9 +348,99 @@ class AcpRuntime(AgentRuntime):
             external_session_id=session.external_session_id,
             runtime=ACP_RUNTIME,
             items=items,
-            complete=True,
+            # In-memory items are a live projection, not the source of
+            # truth — the ACP agent holds the full history. Marking this
+            # complete lets a restart-time empty projection replace (and
+            # thereby delete) the platform's stored timeline.
+            complete=False,
             metadata={"source": "acp.runtime"},
         )
+
+    async def prepare_session_timeline_sync(
+        self,
+        session_id: str,
+        external_session_id: str | None = None,
+    ) -> PreparedSessionTimelineSync | None:
+        """Rebuild the in-memory timeline from the ACP agent's history.
+
+        After a connector restart the in-memory ``session.items`` projection
+        is empty. Rather than pushing an empty snapshot (which used to wipe
+        the platform's stored history), ask the agent to replay its persisted
+        history via ``session/load`` and project the replayed chunks into
+        timeline items. The snapshot returned here is marked complete: it
+        genuinely represents the agent's full history, so the platform may
+        safely replace its stored timeline with it.
+        """
+        session = self._resolve_session(session_id, external_session_id)
+        if session is None:
+            return None
+        if session.items:
+            # Projection already populated — nothing to rebuild.
+            return None
+        if not session.external_session_id:
+            return None
+        client = self._client
+        if client is None or not client.connected:
+            return None
+        try:
+            await self._rebuild_timeline_from_history(session, client)
+        except Exception:
+            logger.exception(
+                "ACP timeline rebuild failed session_id={} external={}",
+                session.session_id,
+                session.external_session_id,
+            )
+            return None
+        if not session.items:
+            # Agent has no history for this session either — do not claim
+            # completeness; let the caller fall back to the (incomplete,
+            # non-destructive) empty snapshot.
+            return None
+        items = tuple(
+            sorted(session.items.values(), key=lambda item: item.order_seq)
+        )
+        snapshot = RuntimeTimelineSnapshot(
+            session_id=session.session_id,
+            external_session_id=session.external_session_id,
+            runtime=ACP_RUNTIME,
+            items=items,
+            complete=True,
+            metadata={"source": "acp.runtime", "reason": "history_rebuild"},
+        )
+        return PreparedSessionTimelineSync(snapshot=snapshot, commit=None)
+
+    async def _rebuild_timeline_from_history(
+        self,
+        session: AcpSession,
+        client: AcpClient,
+    ) -> None:
+        """Replay agent history via session/load and project it as items.
+
+        Hermes streams the full transcript as user/agent message chunks,
+        thought chunks, and tool_call/tool_call_update notifications during
+        ``session/load``. The generic notification path drops those while
+        ``session.replaying`` is set, so this method runs its own projection
+        keyed on a synthetic replay turn id.
+        """
+        session.replay_turn_id = f"acp-replay-{session.turn_seq + 1}"
+        session.replaying = True
+        try:
+            await client.request(
+                "session/load",
+                {
+                    "sessionId": session.external_session_id,
+                    "cwd": session.cwd or self.cwd,
+                    "mcpServers": [],
+                },
+                timeout=300,
+            )
+            # The replay notifications are dispatched asynchronously
+            # (create_task) by the client reader; give them a moment to
+            # drain through the replay projection below.
+            await asyncio.sleep(0.5)
+        finally:
+            session.replaying = False
+            session.replay_turn_id = None
 
     async def get_session_state(
         self,
@@ -586,6 +682,12 @@ class AcpRuntime(AgentRuntime):
     ) -> None:
         outcome = "completed"
         error_payload: Mapping[str, Any] | None = None
+        # Long agent tasks (multi-hour migrations, batch jobs) legitimately
+        # exceed the old 30-minute cap. 4h keeps the two state machines (AA
+        # side + agent side) aligned for realistic workloads; on expiry we
+        # explicitly cancel the agent-side turn so the agent does not keep
+        # running while AA already considers the turn failed.
+        prompt_timeout = 14400.0
         try:
             result = await client.request(
                 "session/prompt",
@@ -593,8 +695,31 @@ class AcpRuntime(AgentRuntime):
                     "sessionId": session.external_session_id,
                     "prompt": [{"type": "text", "text": content}],
                 },
-                timeout=1800,
+                timeout=prompt_timeout,
             )
+        except TimeoutError:
+            # The agent is still processing. Cancel its turn so both sides
+            # agree the turn ended; otherwise the agent keeps is_running=True
+            # and silently queues any follow-up messages.
+            try:
+                await client.request(
+                    "session/cancel",
+                    {"sessionId": session.external_session_id},
+                    timeout=30,
+                )
+            except Exception:
+                logger.exception(
+                    "ACP session/cancel after prompt timeout failed session={}",
+                    session.external_session_id,
+                )
+            outcome = "failed"
+            error_payload = {
+                "code": "acp_turn_timeout",
+                "message": (
+                    f"ACP turn timed out after {prompt_timeout:.0f}s and was "
+                    "cancelled on the agent side"
+                ),
+            }
         except AcpRpcError as exc:
             # Bridge restarts lose the in-memory ACP session; recover by
             # re-loading the session (OpenClaw supports loadSession) and
@@ -628,7 +753,7 @@ class AcpRuntime(AgentRuntime):
                             "sessionId": session.external_session_id,
                             "prompt": [{"type": "text", "text": content}],
                         },
-                        timeout=1800,
+                        timeout=prompt_timeout,
                     )
                 except Exception:
                     raise exc
@@ -719,7 +844,21 @@ class AcpRuntime(AgentRuntime):
         if session is None:
             return
         if session.replaying:
-            # History replay from session/load — not live turn output.
+            # History replay from session/load — route to the dedicated
+            # replay projection (rebuilds timeline items after restart)
+            # instead of the live-turn projection.
+            if session.replay_turn_id:
+                update = params.get("update") or {}
+                if isinstance(update, dict):
+                    try:
+                        await self._project_replay_update(
+                            session, update
+                        )
+                    except Exception:
+                        logger.exception(
+                            "ACP replay projection failed kind={}",
+                            update.get("sessionUpdate"),
+                        )
             return
         update = params.get("update") or {}
         if not isinstance(update, dict):
@@ -865,6 +1004,195 @@ class AcpRuntime(AgentRuntime):
             return
 
         logger.debug("ACP update ignored kind={}", kind)
+
+    async def _project_replay_update(
+        self,
+        session: AcpSession,
+        update: dict[str, Any],
+    ) -> None:
+        """Project a history-replay update into a timeline item.
+
+        Hermes replays persisted history as one user_message_chunk /
+        agent_message_chunk / agent_thought_chunk per message (not streamed
+        in fragments), plus tool_call (start) / tool_call_update (complete)
+        pairs. Unlike the live projection, each replayed message becomes
+        its own item with status "done" and a stable per-message id.
+        """
+        kind = update.get("sessionUpdate")
+        turn_id = session.replay_turn_id or "acp-replay"
+
+        if kind in {"user_message_chunk", "agent_message_chunk"}:
+            content = update.get("content") or {}
+            text = str(content.get("text") or "")
+            if not text:
+                return
+            role = "user" if kind == "user_message_chunk" else "assistant"
+            # Stable id keyed on (session, role, text) — hermes replays each
+            # message as a single chunk, so this is one item per message.
+            item_id = self._stable_id(
+                "msg", session.session_id, "replay", role, text
+            )
+            if item_id in session.items:
+                return
+            content_obj: Any = MarkdownMessageContent(text=text)
+            item = RuntimeTimelineItem(
+                id=item_id,
+                session_id=session.session_id,
+                type="message",
+                status="done",
+                order_seq=self._next_order(session),
+                content_hash=timeline_content_hash(
+                    item_type="message",
+                    status="done",
+                    role=role,
+                    content=_content_mapping(content_obj),
+                ),
+                role=role,
+                turn_id=turn_id,
+                content=_content_mapping(content_obj),
+                source=TimelineSource(
+                    runtime=ACP_RUNTIME,
+                    external_session_id=session.external_session_id,
+                    turn_id=turn_id,
+                    event="acp.replay.message",
+                ).to_mapping(),
+                revision=1,
+            )
+            session.items[item_id] = item
+            return
+
+        if kind == "agent_thought_chunk":
+            content = update.get("content") or {}
+            text = str(content.get("text") or "")
+            if not text:
+                return
+            item_id = self._stable_id(
+                "reason", session.session_id, "replay", text
+            )
+            if item_id in session.items:
+                return
+            content_obj = ReasoningSystemContent(text=text)
+            item = RuntimeTimelineItem(
+                id=item_id,
+                session_id=session.session_id,
+                type="system",
+                status="done",
+                order_seq=self._next_order(session),
+                content_hash=timeline_content_hash(
+                    item_type="system",
+                    status="done",
+                    role="system",
+                    content=_content_mapping(content_obj),
+                ),
+                role="system",
+                turn_id=turn_id,
+                content=_content_mapping(content_obj),
+                source=TimelineSource(
+                    runtime=ACP_RUNTIME,
+                    external_session_id=session.external_session_id,
+                    turn_id=turn_id,
+                    event="acp.replay.thought",
+                ).to_mapping(),
+                revision=1,
+            )
+            session.items[item_id] = item
+            return
+
+        if kind == "tool_call":
+            tool_call_id = str(update.get("toolCallId") or "")
+            title = str(update.get("title") or "tool")
+            if not tool_call_id:
+                return
+            item_id = self._stable_id(
+                "tool", session.session_id, "replay", tool_call_id
+            )
+            if item_id in session.items:
+                return
+            item = ToolTimelineItem(
+                id=item_id,
+                type="tool",
+                status="running",
+                role="tool",
+                turn_id=turn_id,
+                content=ToolCallContent(
+                    kind="tool_call",
+                    title=title,
+                    input=update.get("rawInput"),
+                ),
+                source=TimelineSource(
+                    runtime=ACP_RUNTIME,
+                    external_session_id=session.external_session_id,
+                    turn_id=turn_id,
+                    native_item_id=tool_call_id,
+                    event="acp.replay.tool_call",
+                ),
+            ).to_platform_item(
+                session_id=session.session_id,
+                order_seq=self._next_order(session),
+            )
+            session.items[item_id] = item
+            return
+
+        if kind == "tool_call_update":
+            tool_call_id = str(update.get("toolCallId") or "")
+            if not tool_call_id:
+                return
+            item_id = self._stable_id(
+                "tool", session.session_id, "replay", tool_call_id
+            )
+            existing = session.items.get(item_id)
+            if existing is None:
+                return
+            status = (
+                "failed"
+                if str(update.get("status") or "") == "failed"
+                else "done"
+            )
+            # Replay content: list of {type: "content", content: {text}} blocks
+            # plus raw_output — flatten to a text summary for the platform.
+            replay_content = update.get("content")
+            output_text = None
+            if isinstance(replay_content, list):
+                parts = []
+                for block in replay_content:
+                    if isinstance(block, dict):
+                        inner = block.get("content")
+                        if isinstance(inner, dict) and inner.get("text"):
+                            parts.append(str(inner["text"]))
+                if parts:
+                    output_text = "\n".join(parts)
+            if output_text is None and update.get("raw_output") is not None:
+                output_text = str(update.get("raw_output"))
+            updated = RuntimeTimelineItem(
+                id=existing.id,
+                session_id=existing.session_id,
+                type=existing.type,
+                status=status,
+                order_seq=existing.order_seq,
+                content_hash=timeline_content_hash(
+                    item_type=existing.type,  # type: ignore[arg-type]
+                    status=status,  # type: ignore[arg-type]
+                    role=existing.role,  # type: ignore[arg-type]
+                    content={
+                        **dict(existing.content),
+                        "output": output_text,
+                    },
+                ),
+                role=existing.role,
+                turn_id=existing.turn_id,
+                content={
+                    **dict(existing.content),
+                    "output": output_text,
+                },
+                source=existing.source,
+                revision=existing.revision + 1,
+                metadata=existing.metadata,
+            )
+            session.items[item_id] = updated
+            return
+
+        # plan / available_commands_update / usage_update: not projected.
+        return
 
     # ------------------------------------------------- ACP agent -> client
 
