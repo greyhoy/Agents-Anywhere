@@ -532,6 +532,16 @@ class DshRuntime(AgentRuntime):
             await self.host.runtime_capabilities_update(
                 models.capability_set(params, connector_id=self.host.connector_id)
             )
+        elif method in ("session.capabilities.update", "session.capability.updated"):
+            # The bridge emits session-scoped capability facts under both
+            # spellings (direct notifications use the plural form, the sync
+            # stream the singular one). Without this branch the session-level
+            # facts never reach the server, so the protocol-level projection
+            # (which reports send_message unsupported for DSH) wins and the
+            # client composer stays disabled after a turn ends.
+            await self.host.session_capabilities_update(
+                models.capability_set(params, connector_id=self.host.connector_id)
+            )
         elif method == "timeline.item.upsert" and self.sync_mode != "events":
             await self.host.timeline_item_upsert(
                 models.timeline_item(params.get("item", params))
