@@ -341,6 +341,16 @@ class ConnectorIngestService:
                 ):
                     runtime_state = None
                 else:
+                    # A runtime status transition (e.g. offline -> online after a
+                    # bridge/DSH restart) can flip effective capabilities. Re-project
+                    # them into this envelope so clients receive
+                    # runtime.capability.updated over WS and self-heal stale
+                    # capability state without waiting for a manual refetch.
+                    if (
+                        previous_runtime_state is not None
+                        and previous_runtime_state.status != runtime_state.status
+                    ):
+                        bucket["capability_changed"] = True
                     if (
                         previous_runtime_state is None
                         or previous_runtime_state.status != runtime_state.status
