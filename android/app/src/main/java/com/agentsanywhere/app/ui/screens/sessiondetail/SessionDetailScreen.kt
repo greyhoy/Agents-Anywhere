@@ -1223,6 +1223,7 @@ fun SessionDetailScreen(
         }
     }
 
+
     LaunchedEffect(sessionId, appVisible, state.initialized, realtimeController) {
         if (sessionId == null || !appVisible || !state.initialized) return@LaunchedEffect
         val id = sessionId
@@ -1331,6 +1332,43 @@ fun SessionDetailScreen(
         SessionRuntimeStatus.Blocked,
         SessionRuntimeStatus.Disconnected,
     )
+
+    // Stuck-status watchdog: if the runtime status blocks the composer
+    // (Running/Pending/Waiting/Stopping) for a long time while the timeline
+    // shows no new activity, the live state is stale — e.g. the turn ended
+    // but the terminal WS event was lost on a silently-dead connection.
+    // Force a runtime refresh so the composer recovers without user action.
+    var lastBlockingStatusAtMs by remember(sessionId) { mutableStateOf(0L) }
+    val blockingRuntimeStatus = runtimeStatus in setOf(
+        SessionRuntimeStatus.Waiting,
+        SessionRuntimeStatus.Pending,
+        SessionRuntimeStatus.Running,
+        SessionRuntimeStatus.Stopping,
+    )
+    LaunchedEffect(sessionId, appVisible, blockingRuntimeStatus, state.nextSeq) {
+        if (sessionId == null || !appVisible) return@LaunchedEffect
+        val id = sessionId
+        if (blockingRuntimeStatus) {
+            if (lastBlockingStatusAtMs == 0L) {
+                lastBlockingStatusAtMs = System.currentTimeMillis()
+                return@LaunchedEffect
+            }
+            val stuckMs = System.currentTimeMillis() - lastBlockingStatusAtMs
+            if (stuckMs < STUCK_RUNTIME_STATUS_REFRESH_MS) return@LaunchedEffect
+            // Timeline advanced (state.nextSeq changed restarts this effect),
+            // so only a genuinely quiet-but-"running" state reaches here.
+            val requestState = withContext(Dispatchers.Main.immediate) { state }
+            val refreshed = controller.refreshRuntimeLiveDomains(id, requestState)
+            withContext(Dispatchers.Main.immediate) {
+                if (sessionId == id && appVisible) {
+                    state = controller.mergeRuntimeLiveState(state, requestState, refreshed)
+                }
+            }
+            lastBlockingStatusAtMs = System.currentTimeMillis()
+        } else {
+            lastBlockingStatusAtMs = 0L
+        }
+    }
     val inputEnabled = if (isPreparedSession) {
         true
     } else {
@@ -1949,6 +1987,8 @@ fun SessionDetailScreen(
         )
     }
 }
+
+private const val STUCK_RUNTIME_STATUS_REFRESH_MS = 90_000L
 
 private fun SessionDetailState.effectiveRuntimeStatus(): SessionRuntimeStatus {
     if (runtime.status != SessionRuntimeStatus.Unknown) return runtime.status
