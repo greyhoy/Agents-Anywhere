@@ -146,6 +146,7 @@ import com.agentsanywhere.app.ui.designsystem.ScreenScaffold
 import com.agentsanywhere.app.ui.designsystem.noRippleClickable
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.UUID
@@ -1192,6 +1193,36 @@ fun SessionDetailScreen(
         if (!state.initialized) loadInitialSnapshot()
     }
 
+    // Self-heal: a single failed runtime/capabilities HTTP request (e.g. NAT
+    // dropped the pooled connection after a router re-dial) permanently
+    // disabled the composer with "Sending is unavailable for the current
+    // runtime state." because nothing retried while the WebSocket stayed
+    // healthy. Retry the runtime live domains with exponential backoff until
+    // the error clears; the WS path keeps state fresh afterwards.
+    LaunchedEffect(sessionId, appVisible, state.runtime.errorMessage, state.capabilities.errorMessage) {
+        if (sessionId == null || !appVisible) return@LaunchedEffect
+        val runtimeError = state.runtime.errorMessage
+        val capabilitiesError = state.capabilities.errorMessage
+        if (runtimeError == null && capabilitiesError == null) return@LaunchedEffect
+        val id = sessionId
+        var backoffMs = 5_000L
+        while (isActive) {
+            delay(backoffMs)
+            if (sessionId != id || !appVisible) return@LaunchedEffect
+            val requestState = withContext(Dispatchers.Main.immediate) { state }
+            if (requestState.runtime.errorMessage == null && requestState.capabilities.errorMessage == null) {
+                return@LaunchedEffect
+            }
+            val refreshed = controller.refreshRuntimeLiveDomains(id, requestState)
+            withContext(Dispatchers.Main.immediate) {
+                if (sessionId == id && appVisible) {
+                    state = controller.mergeRuntimeLiveState(state, requestState, refreshed)
+                }
+            }
+            backoffMs = (backoffMs * 2).coerceAtMost(30_000L)
+        }
+    }
+
     LaunchedEffect(sessionId, appVisible, state.initialized, realtimeController) {
         if (sessionId == null || !appVisible || !state.initialized) return@LaunchedEffect
         val id = sessionId
@@ -1634,6 +1665,10 @@ fun SessionDetailScreen(
             stringResource(R.string.session_waiting_approval_placeholder)
         runtimeStatus == SessionRuntimeStatus.Error -> stringResource(R.string.session_error_placeholder)
         runtimeStatus == SessionRuntimeStatus.Disconnected -> stringResource(R.string.session_device_offline_placeholder)
+        // Surface the real load error (e.g. "Could not reach the server")
+        // instead of blaming the runtime state — the runtime itself is fine.
+        state.capabilities.errorMessage != null && !canUseSendMessage && !canUseCommands ->
+            state.capabilities.errorMessage.orEmpty()
         !canUseSendMessage && !canUseCommands -> stringResource(R.string.session_send_unavailable)
         inputEnabled -> stringResource(R.string.session_reply_to, replyTarget)
         else -> stringResource(R.string.session_send_unavailable)

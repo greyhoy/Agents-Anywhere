@@ -241,12 +241,19 @@ class SessionsApi(
         authorizationToken: String,
         ids: List<String>,
     ): RemoteSessionsMutationResponse {
-        return client.postJson(
-            serverUrl = serverUrl,
-            path = "/sessions/archive",
-            body = JSONArray(ids),
-            authorizationToken = authorizationToken,
-        ).toRemoteSessionsMutationResponse()
+        // Idempotent server-side (archiving an archived session is a no-op),
+        // so one retry on a network failure is safe. The pooled OkHttp
+        // connection can be dead after the router re-dials (NAT mapping
+        // dropped) which surfaced as "Could not reach the server" on the
+        // phone even though the server was reachable.
+        return retryOnceOnNetworkError {
+            client.postJson(
+                serverUrl = serverUrl,
+                path = "/sessions/archive",
+                body = JSONArray(ids),
+                authorizationToken = authorizationToken,
+            )
+        }.toRemoteSessionsMutationResponse()
     }
 
     fun unarchiveSessions(
@@ -254,12 +261,15 @@ class SessionsApi(
         authorizationToken: String,
         ids: List<String>,
     ): RemoteSessionsMutationResponse {
-        return client.postJson(
-            serverUrl = serverUrl,
-            path = "/sessions/unarchive",
-            body = JSONArray(ids),
-            authorizationToken = authorizationToken,
-        ).toRemoteSessionsMutationResponse()
+        // Same idempotency argument as archiveSessions.
+        return retryOnceOnNetworkError {
+            client.postJson(
+                serverUrl = serverUrl,
+                path = "/sessions/unarchive",
+                body = JSONArray(ids),
+                authorizationToken = authorizationToken,
+            )
+        }.toRemoteSessionsMutationResponse()
     }
 
     fun markSessionsRead(
@@ -267,12 +277,15 @@ class SessionsApi(
         authorizationToken: String,
         ids: List<String>,
     ): RemoteSessionsMutationResponse {
-        return client.postJson(
-            serverUrl = serverUrl,
-            path = "/sessions/read",
-            body = JSONArray(ids),
-            authorizationToken = authorizationToken,
-        ).toRemoteSessionsMutationResponse()
+        // Same idempotency argument as archiveSessions.
+        return retryOnceOnNetworkError {
+            client.postJson(
+                serverUrl = serverUrl,
+                path = "/sessions/read",
+                body = JSONArray(ids),
+                authorizationToken = authorizationToken,
+            )
+        }.toRemoteSessionsMutationResponse()
     }
 
     fun markSessionRead(

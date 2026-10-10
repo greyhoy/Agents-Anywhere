@@ -47,7 +47,11 @@ class ApiClient(
         } catch (exc: IllegalArgumentException) {
             throw ApiException("The server URL is invalid.", cause = exc)
         } catch (exc: IOException) {
-            throw ApiException("Could not reach the server. Check the URL and network.", cause = exc)
+            throw ApiException(
+                "Could not reach the server. Check the URL and network.",
+                cause = exc,
+                isNetworkError = true,
+            )
         }
     }
 
@@ -293,7 +297,11 @@ class ApiClient(
         } catch (exc: IllegalArgumentException) {
             throw ApiException("The server URL is invalid.", cause = exc)
         } catch (exc: IOException) {
-            throw ApiException("Could not reach the server. Check the URL and network.", cause = exc)
+            throw ApiException(
+                "Could not reach the server. Check the URL and network.",
+                cause = exc,
+                isNetworkError = true,
+            )
         }
     }
 
@@ -398,4 +406,16 @@ class ApiException(
     val statusCode: Int? = null,
     cause: Throwable? = null,
     val errorCode: String? = null,
+    /** True when the failure was a transport/network error, not a server response. */
+    val isNetworkError: Boolean = false,
 ) : Exception(message, cause)
+
+/** Run an idempotent API call, retrying once on transport-level failures. */
+internal inline fun <T> retryOnceOnNetworkError(block: () -> T): T {
+    return try {
+        block()
+    } catch (error: ApiException) {
+        if (!error.isNetworkError) throw error
+        block()
+    }
+}
