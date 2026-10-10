@@ -20,7 +20,7 @@ export function stringField(value: Record<string, unknown>, key: string): string
 /** Read an optional string field from process-boundary input. */
 export function optionalStringField(value: Record<string, unknown>, key: string): string | undefined {
   const candidate = value[key]
-  if (candidate === undefined) return undefined
+  if (candidate === undefined || candidate === null) return undefined
   if (typeof candidate !== 'string') {
     throw new BridgeError('INVALID_PARAMS', `${key} must be a string when present`, { retryable: false })
   }

@@ -51,7 +51,7 @@ export async function writeJsonAtomic(path: string, value: unknown): Promise<voi
   const parent = dirname(path)
   await mkdir(parent, { recursive: true })
   const temporary = join(parent, `.${randomUUID()}.tmp`)
-  const handle = await open(temporary, 'wx', 0o600)
+  const handle = await open(temporary, 'wx', 0o644)
   try {
     await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, 'utf8')
     await handle.sync()
@@ -68,11 +68,11 @@ export async function writeJsonAtomic(path: string, value: unknown): Promise<voi
 }
 
 /** Publish one JSON file without replacing an existing record. */
-export async function writeJsonNoClobber(path: string, value: unknown): Promise<'created' | 'exists'> {
+export async function writeJsonNoClobber(path: string, value: unknown, mode: 0o600 | 0o644 = 0o600): Promise<'created' | 'exists'> {
   const parent = dirname(path)
   await mkdir(parent, { recursive: true })
   const temporary = join(parent, `.${randomUUID()}.tmp`)
-  const handle = await open(temporary, 'wx', 0o600)
+  const handle = await open(temporary, 'wx', mode)
   try {
     await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, 'utf8')
     await handle.sync()

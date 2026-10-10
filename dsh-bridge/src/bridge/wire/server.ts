@@ -59,8 +59,8 @@ export class LoopbackJsonRpcServer {
   /** Bind an ephemeral loopback port and exclusively publish its authenticated descriptor. */
   async start(): Promise<BridgeEndpoint> {
     if (this.server !== undefined) throw new Error('agents-anywhere bridge endpoint is already started')
-    await mkdir(this.stateRoot, { recursive: true, mode: 0o700 })
-    await chmod(this.stateRoot, 0o700)
+    await mkdir(this.stateRoot, { recursive: true, mode: 0o755 })
+    await chmod(this.stateRoot, 0o755)
     const server = createServer(socket => this.accept(socket))
     this.server = server
     await new Promise<void>((resolve, reject) => {

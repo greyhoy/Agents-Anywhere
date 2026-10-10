@@ -40,8 +40,10 @@ describe('timeline projection', () => {
     ] as unknown as SessionEvent[]
     const items = projectTimeline(header, events)
     expect(items).toHaveLength(2)
-    expect(items[0]?.payload).toMatchObject({ role: 'user', text: 'hello', messageId: 'user-message' })
-    expect(items[1]?.payload).toMatchObject({ callId: 'call-1', name: 'read', arguments: { path: 'file' }, status: 'running' })
+    expect(items[0]?.content).toMatchObject({ text: 'hello' })
+    expect(items[0]?.role).toBe('user')
+    expect(items[1]?.content).toMatchObject({ callId: 'call-1', name: 'read', arguments: { path: 'file' } })
+    expect(items[1]?.status).toBe('running')
     expect(items[1]?.type).toBe('tool')
     expect(JSON.stringify(items)).not.toContain('secret-provider')
     expect(JSON.stringify(items)).not.toContain('internal context')
@@ -66,12 +68,12 @@ describe('timeline projection', () => {
     const items = projectTimeline(header, events)
     expect(items).toHaveLength(1)
     expect(items[0]?.type).toBe('tool')
-    expect(items[0]?.payload).toMatchObject({
+    expect(items[0]?.content).toMatchObject({
       callId: 'call-bash-1',
       name: 'bash',
       arguments: { command: 'sw_vers' },
       text: 'macOS 15.0.1',
-      status: 'done',
     })
+    expect(items[0]?.status).toBe('done')
   })
 })

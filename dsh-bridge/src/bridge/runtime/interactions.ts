@@ -11,7 +11,7 @@ import { sha256Hex } from '../projection/identity.js'
 import { BridgeError } from '../wire/errors.js'
 import type { InteractionNotice } from '../wire/protocol.js'
 import { arrayField, isRecord, stringField } from '../wire/validation.js'
-import type { SessionController } from './session-controller.js'
+import { sessionEventsOf, type SessionController } from './session-controller.js'
 import {
   bridgeMuxEnvelope,
   type BridgeClientResponse,
@@ -500,7 +500,7 @@ export class InteractionManager {
       .filter((pending): pending is PendingApproval => pending.kind === 'approval')
       .map(pending => pending.approvalId))
     const decided = new Set<string>()
-    const events = controller.agent?.session.events ?? []
+    const events = controller.agent ? sessionEventsOf(controller.agent.session) : []
     for (let index = events.length - 1; index >= 0; index -= 1) {
       const event = events[index]
       if (event?.type === 'approval/decided') decided.add(String(event.data.id))

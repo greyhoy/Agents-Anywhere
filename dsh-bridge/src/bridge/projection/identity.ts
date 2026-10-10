@@ -13,6 +13,16 @@ export function timelineItemId(externalSessionId: string, projectionKind: string
   return `dsh_${sha256Hex(`${externalSessionId}\0${projectionKind}\0${businessId}`)}`
 }
 
+
+/** Deterministic platform Session identity for an unbound external DSH session. */
+export function deterministicSessionId(externalSessionId: string): string {
+  const prefix = `aa_${sha256Hex('agentsAnywhereConnector').slice(0, 16)}_`
+  if (externalSessionId.startsWith(prefix) && /^[\w-]{1,128}$/.test(externalSessionId.slice(prefix.length))) {
+    return externalSessionId.slice(prefix.length)
+  }
+  return `sess_dsh_${sha256Hex(`agentsAnywhereConnector:dsh:${externalSessionId}`).slice(0, 24)}`
+}
+
 /** Deterministic DSH MessageId text for one AA client operation. */
 export function deterministicMessageId(platformSessionId: string, clientMessageId: string): string {
   return `aa-${sha256Hex(`${platformSessionId}\0${clientMessageId}`)}`

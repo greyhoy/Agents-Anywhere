@@ -17,6 +17,7 @@ import type {} from '@deepseek-ai/dsh-workspace'
 import {
   contentHash,
   deterministicMessageId,
+  deterministicSessionId,
   modelSelectionId,
   permissionSelectionId,
   sha256Hex,
@@ -30,7 +31,7 @@ import { RUNTIME_ID, type SessionMeta, type TimelineItem } from '../wire/protoco
 import { sessionCapabilities } from './capabilities.js'
 import type { CatalogManager } from './catalogs.js'
 import type { InteractionManager } from './interactions.js'
-import { SessionController } from './session-controller.js'
+import { SessionController, sessionEventsOf } from './session-controller.js'
 import { sessionSyncRevision, sessionVisibility } from './session-visibility.js'
 import {
   bridgeHostEnvelope,
@@ -130,8 +131,8 @@ export class SessionManager {
       if (controller === undefined) return
       controller.localAppendsSinceRevision += 1
       return Promise.all([
-        this.reconcileLiveSelections(controller, session.events),
-        this.publishEvent(controller, session.header, session.events, event),
+        this.reconcileLiveSelections(controller, sessionEventsOf(session)),
+        this.publishEvent(controller, session.header, sessionEventsOf(session), event),
         this.publishReplicaEvent(controller.agent, session.id, event),
       ]).then(() => undefined)
     })
@@ -193,7 +194,7 @@ export class SessionManager {
     sessions: SessionMeta[]
     nextCursor: string | null
   }> {
-    const snapshots = await this.ctx.sessionPersistence.listSnapshots(signal)
+    const snapshots = await this.listSnapshotsCompat(signal)
     await this.detectConcurrentWriters(snapshots)
     const archivedSessionIds = this.archivedSessionIds()
     const metas = await Promise.all(snapshots.map(snapshot => this.metaFor(snapshot, archivedSessionIds, signal)))
@@ -228,11 +229,11 @@ export class SessionManager {
     signal?: AbortSignal,
   ): Promise<Record<string, unknown>> {
     await this.ensureBinding(platformSessionId, externalSessionId)
-    const { meta, events } = await this.ctx.sessionPersistence.readFrom(SessionId(externalSessionId), fromSeq, signal)
+    const { meta, events } = await this.readFromCompat(SessionId(externalSessionId), fromSeq, signal)
     const selectedEvents = events.slice(0, eventLimit)
-    const snapshots = await this.ctx.sessionPersistence.listSnapshots(signal)
+    const snapshots = await this.listSnapshotsCompat(signal)
     const snapshot = snapshots.find(item => item.header.id === meta.id)
-    const inspection = await this.ctx.sessionPersistence.inspect(meta.id, signal)
+    const inspection = await this.inspectCompat(meta.id, signal)
     const visibility = sessionVisibility(
       inspection.meta,
       inspection.events,
@@ -243,7 +244,7 @@ export class SessionManager {
       sessionId: platformSessionId,
       externalSessionId,
       runtime: RUNTIME_ID,
-      items: projectTimeline(meta, selectedEvents, false),
+      items: projectTimeline(meta, selectedEvents, false, platformSessionId),
       complete: selectedEvents.length === events.length,
       watermark: timelineWatermark(selectedEvents, fromSeq, revision === undefined ? undefined : String(revision)),
     }
@@ -305,7 +306,7 @@ export class SessionManager {
         externalSessionId,
       })
     }
-    const existingSnapshot = (await this.ctx.sessionPersistence.listSnapshots(signal))
+    const existingSnapshot = (await this.listSnapshotsCompat(signal))
       .find(item => String(item.header.id) === externalSessionId)
     if (reservation.committed && existingSnapshot !== undefined) {
       await this.verifyCommittedCreate(operation.sessionId, operation.clientMessageId, operation.content, existingSnapshot.header.id, signal)
@@ -329,7 +330,7 @@ export class SessionManager {
     return await controller.enqueue(async () => {
       try {
         if (controller.agent === undefined) {
-          const materialized = existingSnapshot ?? (await this.ctx.sessionPersistence.listSnapshots(signal))
+          const materialized = existingSnapshot ?? (await this.listSnapshotsCompat(signal))
             .find(item => String(item.header.id) === externalSessionId)
           if (materialized === undefined) {
             const handle = await this.ctx.agents.create({
@@ -345,7 +346,7 @@ export class SessionManager {
           }
         }
         const agent = controller.requireLive(id => this.ctx.agents.get(id))
-        if (this.ctx.permissionPresets.current(agent.session.events) !== permission) {
+        if (this.catalogs.permissionFor(sessionEventsOf(agent.session)) !== permission) {
           this.ctx.permissionPresets.set(agent.session, permission)
           await controller.updateSelections(undefined, permissionSelectionId(permission))
         }
@@ -353,7 +354,7 @@ export class SessionManager {
         const submission = await this.submitMessage(controller, 'create', operation.content, operation.clientMessageId, false)
         await this.ensureWorkspaceMembership(operation.sessionId, agent.session.header)
         await this.metadata.commitCreation(reservation)
-        const snapshot = (await this.ctx.sessionPersistence.listSnapshots())
+        const snapshot = (await this.listSnapshotsCompat())
           .find(item => String(item.header.id) === externalSessionId)
         if (snapshot !== undefined) {
           await this.emit(
@@ -382,7 +383,7 @@ export class SessionManager {
     skippedSessions: number
     failedSessions: number
   }> {
-    const snapshots = await this.ctx.sessionPersistence.listSnapshots(signal)
+    const snapshots = await this.listSnapshotsCompat(signal)
     const byId = new Map(snapshots.map(snapshot => [String(snapshot.header.id), snapshot.header]))
     const candidates = this.metadata.bindings()
       .filter(binding => binding.externalSessionId.startsWith('aa-'))
@@ -660,7 +661,7 @@ export class SessionManager {
     if (payload.type !== 'session/event') return
     let history = this.replicaHistories.get(payload.sessionId)
     if (history === undefined) {
-      const inspected = await this.ctx.sessionPersistence.inspect(payload.sessionId)
+      const inspected = await this.inspectCompat(payload.sessionId)
       history = { header: inspected.meta, events: [...inspected.events] }
       this.replicaHistories.set(payload.sessionId, history)
     }
@@ -707,7 +708,7 @@ export class SessionManager {
         throw new BridgeError('INVALID_PARAMS', 'clientTimeZone must be UTC or a valid IANA Area/Location name.', { retryable: false })
       }
       const clientContentHash = contentHash({ mode: input.mode, content: input.content })
-      const existing = [...agent.session.events]
+      const existing = [...sessionEventsOf(agent.session)]
         .filter((event): event is Extract<SessionEvent, { type: 'user/message' }> => event.type === 'user/message')
         .map(event => event.data)
         .concat(agent.inbox.nextTurn, agent.inbox.nextStep)
@@ -869,7 +870,7 @@ export class SessionManager {
   }
 
   private async coldController(platformSessionId: string | undefined, externalSessionId: string, signal?: AbortSignal): Promise<SessionController> {
-    const inspection = await this.ctx.sessionPersistence.inspect(SessionId(externalSessionId), signal)
+    const inspection = await this.inspectCompat(SessionId(externalSessionId), signal)
     const model = await this.selectionFromEvents(inspection.events)
     const permission = this.catalogs.permissionFor(inspection.events)
     const controller = new SessionController(
@@ -904,7 +905,7 @@ export class SessionManager {
       }
       return
     }
-    const inspection = await this.ctx.sessionPersistence.inspect(externalSessionId, signal)
+    const inspection = await this.inspectCompat(externalSessionId, signal)
     const expectedMessageId = deterministicMessageId(platformSessionId, clientMessageId)
     const message = findPersistedMessage(inspection.events, expectedMessageId)
     if (message === undefined) {
@@ -956,20 +957,20 @@ export class SessionManager {
         if (!(error instanceof BridgeError)) throw error
       }
       if (agent !== undefined) {
-        await this.reconcileLiveSelections(controller, agent.session.events)
+        await this.reconcileLiveSelections(controller, sessionEventsOf(agent.session))
         return agent
       }
     }
     if (controller.status === 'error') {
-      const inspection = await this.ctx.sessionPersistence.inspect(controller.externalSessionId, signal)
+      const inspection = await this.inspectCompat(controller.externalSessionId, signal)
       controller.selection.current = await this.selectionFromEvents(inspection.events)
       await controller.observeSelections(undefined, this.catalogs.permissionFor(inspection.events))
     }
     const existing = this.ctx.agents.get(controller.externalSessionId)
     if (existing !== undefined) {
       controller.attachBorrowed(existing)
-      await this.reconcileLiveSelections(controller, existing.session.events)
-      const snapshot = (await this.ctx.sessionPersistence.listSnapshots(signal))
+      await this.reconcileLiveSelections(controller, sessionEventsOf(existing.session))
+      const snapshot = (await this.listSnapshotsCompat(signal))
         .find(item => item.header.id === controller.externalSessionId)
       controller.lastObservedRevision = snapshot?.revision
       controller.localAppendsSinceRevision = 0
@@ -988,7 +989,7 @@ export class SessionManager {
       setup: agentCtx => { installModelSelection(agentCtx, controller.selection) },
     })
     controller.attach(handle)
-    const snapshot = (await this.ctx.sessionPersistence.listSnapshots(signal))
+    const snapshot = (await this.listSnapshotsCompat(signal))
       .find(item => item.header.id === controller.externalSessionId)
     controller.lastObservedRevision = snapshot?.revision
     controller.localAppendsSinceRevision = 0
@@ -1007,7 +1008,7 @@ export class SessionManager {
     if (platformSessionId === undefined) throw new Error('cannot submit before binding a platform Session')
     const agent = controller.requireLive(id => this.ctx.agents.get(id))
     const expectedMessageId = deterministicMessageId(platformSessionId, clientMessageId)
-    const logged = findMessage(agent.session.events, expectedMessageId)
+    const logged = findMessage(sessionEventsOf(agent.session), expectedMessageId)
     const pending = [...agent.inbox.nextTurn, ...agent.inbox.nextStep]
       .find(message => String(message.id) === expectedMessageId)
     if ((logged !== undefined && !sameHumanMessage(logged.data, text))
@@ -1030,7 +1031,9 @@ export class SessionManager {
         id: MessageId(stored.record.messageId),
         role: 'user' as const,
         content: [{ type: 'text' as const, text }],
-        source: { kind: 'user' as const },
+        // Keep clientMessageId in the durable source so the timeline projector
+        // can surface it to AA clients for optimistic-message reconciliation.
+        source: { kind: 'user' as const, clientMessageId } as Agent['inbox']['nextTurn'][number]['source'],
       })
       if (steer) agent.steer(message)
       else agent.followup(message)
@@ -1105,12 +1108,17 @@ export class SessionManager {
   private async reconcileAttachedSelections(controller: SessionController): Promise<void> {
     const agent = controller.agent
     if (agent === undefined || this.ctx.agents.get(agent.id) !== agent) return
-    await this.reconcileLiveSelections(controller, agent.session.events)
+    await this.reconcileLiveSelections(controller, sessionEventsOf(agent.session))
   }
 
   private async reconcileLiveSelections(controller: SessionController, events: readonly SessionEvent[]): Promise<void> {
     const model = controller.ownership === 'owned' ? undefined : await this.selectionFromEvents(events)
     await controller.observeSelections(model, this.catalogs.permissionFor(events))
+  }
+
+  /** Resolve the durable DSH Session ID bound to one AA platform Session ID. */
+  bindingForPlatform(platformSessionId: string): string | undefined {
+    return this.metadata.bindingForPlatform(platformSessionId)?.externalSessionId
   }
 
   private async ensureBinding(platformSessionId: string, externalSessionId: string): Promise<void> {
@@ -1122,7 +1130,7 @@ export class SessionManager {
         externalSessionId,
       })
     }
-    const exists = (await this.ctx.sessionPersistence.listSnapshots())
+    const exists = (await this.listSnapshotsCompat())
       .some(item => String(item.header.id) === externalSessionId)
     if (!exists) {
       throw new BridgeError('SESSION_NOT_FOUND', 'The DSH Session does not exist.', {
@@ -1137,17 +1145,69 @@ export class SessionManager {
     }
   }
 
+  // ─── DSH 0.2.0 sessionPersistence compatibility layer ──────────────────────
+  //
+  // The plugin was written against the 0.1.x contract (`listSnapshots`,
+  // `inspect`, `readFrom`). DSH 0.2.0-rc.2 renamed/replaced them:
+  //   * `listSnapshots()` → `list()` (same `SessionPersistenceSnapshot[]` shape)
+  //   * `inspect(id)`     → `open(id, 'read')` + `handle.read()` + `handle.close()`
+  //     (meta comes from `list()`/`stat()`; events from `handle.read()`)
+  //   * `readFrom(id, fromSeq)` → `open(id, 'read')` + `handle.read(fromSeq)`
+  // These helpers keep the call sites on the old vocabulary while targeting
+  // whichever API the host provides, so the bridge works on both generations.
+
+  /** List stored sessions across DSH generations. */
+  private async listSnapshotsCompat(signal?: AbortSignal): Promise<readonly SessionPersistenceSnapshot[]> {
+    const persistence = this.ctx.sessionPersistence as unknown as Record<string, unknown>
+    if (typeof persistence.listSnapshots === 'function') {
+      return await (persistence as unknown as { listSnapshots(signal?: AbortSignal): Promise<readonly SessionPersistenceSnapshot[]> }).listSnapshots(signal)
+    }
+    return await (persistence as unknown as { list(options?: { signal?: AbortSignal }): Promise<readonly SessionPersistenceSnapshot[]> }).list(signal === undefined ? undefined : { signal })
+  }
+
+  /** Read one session's meta + events across DSH generations (0.1.x `inspect`). */
+  private async inspectCompat(id: SessionId, signal?: AbortSignal): Promise<{ meta: SessionHeader, events: readonly SessionEvent[] }> {
+    const persistence = this.ctx.sessionPersistence as unknown as Record<string, unknown>
+    if (typeof persistence.inspect === 'function') {
+      return await (persistence as unknown as { inspect(id: SessionId, signal?: AbortSignal): Promise<{ meta: SessionHeader, events: readonly SessionEvent[] }> }).inspect(id, signal)
+    }
+    const handle = await (persistence as unknown as { open(id: SessionId, access: 'read', options?: { signal?: AbortSignal }): Promise<{ header: SessionHeader, read(offset?: number, length?: number, options?: { signal?: AbortSignal }): Promise<{ events: readonly SessionEvent[] }>, close(): Promise<void> }> }).open(id, 'read', signal === undefined ? undefined : { signal })
+    try {
+      const read = await handle.read(0, undefined, signal === undefined ? undefined : { signal })
+      return { meta: handle.header, events: read.events }
+    } finally {
+      await handle.close().catch(() => undefined)
+    }
+  }
+
+  /** Read an event suffix across DSH generations (0.1.x `readFrom`). */
+  private async readFromCompat(id: SessionId, fromSeq: number, signal?: AbortSignal): Promise<{ meta: SessionHeader, events: readonly SessionEvent[] }> {
+    const persistence = this.ctx.sessionPersistence as unknown as Record<string, unknown>
+    if (typeof persistence.readFrom === 'function') {
+      return await (persistence as unknown as { readFrom(id: SessionId, fromSeq: number, signal?: AbortSignal): Promise<{ meta: SessionHeader, events: readonly SessionEvent[] }> }).readFrom(id, fromSeq, signal)
+    }
+    const handle = await (persistence as unknown as { open(id: SessionId, access: 'read', options?: { signal?: AbortSignal }): Promise<{ header: SessionHeader, read(offset?: number, length?: number, options?: { signal?: AbortSignal }): Promise<{ events: readonly SessionEvent[] }>, close(): Promise<void> }> }).open(id, 'read', signal === undefined ? undefined : { signal })
+    try {
+      const read = await handle.read(fromSeq, undefined, signal === undefined ? undefined : { signal })
+      return { meta: handle.header, events: read.events }
+    } finally {
+      await handle.close().catch(() => undefined)
+    }
+  }
+
   private async metaFor(
     snapshot: SessionPersistenceSnapshot,
     archivedSessionIds: ReadonlySet<SessionId>,
     signal?: AbortSignal,
   ): Promise<SessionMeta> {
-    const inspection = await this.ctx.sessionPersistence.inspect(snapshot.header.id, signal)
+    const inspection = await this.inspectCompat(snapshot.header.id, signal)
     const title = foldSessionTitle(inspection.events)?.title ?? null
     const orderingTime = new Date(inspection.events.at(-1)?.time ?? snapshot.header.createdAt).toISOString()
     const visibility = sessionVisibility(snapshot.header, inspection.events, archivedSessionIds)
+    const externalId = String(snapshot.header.id)
+    const bound = this.metadata.bindingForExternal(externalId)?.platformSessionId
     return {
-      sessionId: this.metadata.bindingForExternal(String(snapshot.header.id))?.platformSessionId ?? null,
+      sessionId: bound ?? deterministicSessionId(externalId),
       externalSessionId: String(snapshot.header.id),
       runtime: RUNTIME_ID,
       title,
@@ -1172,7 +1232,7 @@ export class SessionManager {
     const platformSessionId = controller.platformSessionId
     if (platformSessionId === undefined) return
     if (event.type === 'session/title') {
-      const snapshots = await this.ctx.sessionPersistence.listSnapshots()
+      const snapshots = await this.listSnapshotsCompat()
       const snapshot = snapshots.find(item => item.header.id === header.id)
       if (snapshot !== undefined) {
         await this.emit(
@@ -1181,7 +1241,7 @@ export class SessionManager {
         )
       }
     }
-    const projected = projectTimeline(header, events, true)
+    const projected = projectTimeline(header, events, true, controller.platformSessionId)
     const candidates = projectedItemsForEvent(projected, header, event)
     for (const candidate of candidates) {
       await this.emit('timeline.item.upsert', {
@@ -1277,7 +1337,7 @@ export class SessionManager {
   }
 
   private async revisionOf(id: SessionId, signal?: AbortSignal): Promise<SessionPersistenceRevision | undefined> {
-    return (await this.ctx.sessionPersistence.listSnapshots(signal)).find(item => item.header.id === id)?.revision
+    return (await this.listSnapshotsCompat(signal)).find(item => item.header.id === id)?.revision
   }
 
   private encodeCursor(value: CursorValue): string {

@@ -68,9 +68,32 @@ export class CatalogManager {
     return preset
   }
 
-  /** Encode the effective permission of an existing Session log. */
-  permissionFor(events: Parameters<Context['permissionPresets']['current']>[0]): string {
-    return permissionSelectionId(this.ctx.permissionPresets.current(events))
+  /** Encode the effective permission of an existing Session log (cold fold, no live Session required). */
+  permissionFor(events: readonly unknown[]): string {
+    let state: { preset: string | null, sandbox: string | null, approval: string | null } = { preset: null, sandbox: null, approval: null }
+    for (const event of events) {
+      const record = event as { type?: string, data?: { preset?: string, mode?: string, policy?: string } }
+      if (record?.type === 'permission/preset' && typeof record.data?.preset === 'string') state = { ...state, preset: record.data.preset }
+      else if (record?.type === 'sandbox/mode' && typeof record.data?.mode === 'string') state = { ...state, sandbox: record.data.mode }
+      else if (record?.type === 'approval/policy' && typeof record.data?.policy === 'string') state = { ...state, approval: record.data.policy }
+    }
+    const service = this.ctx.permissionPresets
+    const sandbox = state.sandbox ?? (this.ctx as unknown as { shell: { sandboxMode: string } }).shell.sandboxMode
+    const approval = state.approval ?? (this.ctx as unknown as { approval: { config: { policy: string } } }).approval.config.policy ?? 'ask'
+    if (state.preset !== null) {
+      try {
+        const spec = service.resolve(state.preset)
+        if (spec.sandbox === sandbox && spec.approval === approval) return permissionSelectionId(state.preset)
+      } catch { /* preset no longer configured */ }
+    }
+    for (const name of service.names) {
+      if (name === 'custom' || name === 'auto') continue
+      try {
+        const spec = service.resolve(name)
+        if (spec.sandbox === sandbox && spec.approval === approval) return permissionSelectionId(name)
+      } catch { continue }
+    }
+    return permissionSelectionId('custom')
   }
 
   private async build(): Promise<CatalogSnapshot> {

@@ -23,6 +23,11 @@ const nextConfig: NextConfig = {
   allowedDevOrigins: ["**.*", "localhost", "*.localhost"],
   output: staticExport ? "export" : undefined,
   trailingSlash: staticExport,
+  // NOTE: keep-alive is configured via CLI flag (`next start --keepAliveTimeout
+  // 75000` in the systemd unit), NOT here — Next 16 does not read this value
+  // from next.config. Idle keep-alive connections closed after 5s (Node http
+  // default) caused ERR_CONNECTION_RESET on non-idempotent PATCH requests
+  // (sidebar archive) when browsers reused the dead socket.
   env: {
     NEXT_PUBLIC_AGENTS_ANYWHERE_API: browserApiTarget,
     NEXT_PUBLIC_AGENTS_ANYWHERE_API_NAMESPACE: apiNamespace,

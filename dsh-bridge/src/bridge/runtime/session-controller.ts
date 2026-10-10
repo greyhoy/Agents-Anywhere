@@ -209,3 +209,12 @@ export function sameModelSelection(
     && left?.model === right?.model
     && left?.reasoningEffort === right?.reasoningEffort
 }
+
+/** Read a live Session's full event log across DSH generations (0.1.x `events`, 0.2.x `snapshotEvents`). */
+export function sessionEventsOf<E>(session: { snapshotEvents?: () => readonly E[]; events?: readonly E[] }): readonly E[] {
+  if (typeof session.snapshotEvents === 'function') {
+    return session.snapshotEvents()
+  }
+  const legacy = session.events
+  return Array.isArray(legacy) ? legacy : []
+}

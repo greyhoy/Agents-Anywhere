@@ -17,6 +17,8 @@ export type ApiRequestOptions = Omit<RequestInit, "body"> & {
   token?: string | null;
   auth?: boolean;
   query?: Record<string, string | number | boolean | null | undefined>;
+  /** Set false to opt out of the single automatic retry on network errors. */
+  retryOnNetworkError?: boolean;
 };
 
 export const API_NAMESPACE = normalizeApiNamespace(process.env.NEXT_PUBLIC_AGENTS_ANYWHERE_API_NAMESPACE ?? "/api/v2");
@@ -79,6 +81,27 @@ export class ApiClient {
   }
 
   async request<T>(path: string, options: ApiRequestOptions = {}): Promise<T> {
+    // One transparent retry on network-layer failure. The server (and any
+    // intermediary) closes idle keep-alive connections; browsers reuse the
+    // dead socket for non-idempotent requests (PATCH/DELETE) and surface
+    // ERR_CONNECTION_RESET instead of retrying. Retrying once on a fresh
+    // connection is safe for our API surface (auth/session mutations are
+    // idempotent by id) and fixes "Failed to fetch" after idle periods.
+    const maxAttempts = options.retryOnNetworkError === false ? 1 : 2;
+    let lastNetworkError: ApiError | null = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await this.requestOnce<T>(path, options);
+      } catch (error) {
+        const isNetworkError = error instanceof ApiError && error.kind === "network";
+        if (!isNetworkError || attempt === maxAttempts) throw error;
+        lastNetworkError = error as ApiError;
+      }
+    }
+    throw lastNetworkError!;
+  }
+
+  private async requestOnce<T>(path: string, options: ApiRequestOptions): Promise<T> {
     const url = this.buildUrl(path, options.query);
     const headers = new Headers(options.headers);
     const body = normalizeBody(options.body);

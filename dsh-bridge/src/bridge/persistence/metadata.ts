@@ -132,7 +132,7 @@ export class MetadataStore {
       externalSessionId: `aa-${randomUUID()}`,
       committed: false,
     }
-    if (await writeJsonNoClobber(path, record) === 'created') return record
+    if (await writeJsonNoClobber(path, record, 0o644) === 'created') return record
     const existing = creationRecord(await readOptionalJson<unknown>(path))
     if (existing.platformSessionId !== platformSessionId || existing.clientMessageId !== clientMessageId) {
       throw new BridgeError('PERSISTENCE_ERROR', 'The creation reservation is corrupt.', { retryable: false })
@@ -162,7 +162,7 @@ export class MetadataStore {
       messageId: deterministicMessageId(input.platformSessionId, input.clientMessageId),
     }
     const path = this.path('messages', `${record.platformSessionId}\0${record.clientMessageId}`)
-    if (await writeJsonNoClobber(path, record) === 'created') return { record, duplicate: false }
+    if (await writeJsonNoClobber(path, record, 0o644) === 'created') return { record, duplicate: false }
     const existing = messageRecord(await readOptionalJson<unknown>(path))
     if (existing.operation !== record.operation
       || existing.contentHash !== record.contentHash

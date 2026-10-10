@@ -25,17 +25,20 @@ export function projectTimeline(
   header: SessionHeader,
   events: readonly SessionEvent[],
   includeChunks = false,
+  platformSessionId?: string,
 ): TimelineItem[] {
   const items = new Map<string, MutableItem>()
   for (const event of events) {
     switch (event.type) {
       case 'user/message': {
         if (event.data.source.kind !== 'user') break
-        const payload = {
+        const payload: Record<string, unknown> = {
           role: 'user',
           text: textContent(event.data.content),
           messageId: String(event.data.id),
         }
+        const clientMessageId = messageSourceClientMessageId(event.data.source)
+        if (clientMessageId !== undefined) payload.clientMessageId = clientMessageId
         set(items, header, 'message', String(event.data.id), event.seq, payload)
         break
       }
@@ -202,7 +205,114 @@ export function projectTimeline(
   }
   return [...items.values()]
     .sort((left, right) => left.orderSeq - right.orderSeq || left.id.localeCompare(right.id))
-    .map(item => ({ ...item, contentHash: contentHash(item.payload) }))
+    .map(item => canonicalItem(header, item, platformSessionId))
+}
+
+/** Canonical AA timeline item: platform-decoded shape with a matching content hash. */
+function canonicalItem(header: SessionHeader, item: MutableItem, platformSessionId?: string): TimelineItem {
+  const payload = item.payload
+  const record = payload as Record<string, unknown>
+  let type: TimelineItem['type']
+  let status: string
+  let role: string | null
+  let content: Record<string, unknown>
+  switch (item.type) {
+    case 'message': {
+      type = 'message'
+      role = String(record.role ?? 'assistant')
+      status = 'done'
+      content = role === 'user'
+        ? {
+            kind: 'markdown', format: 'markdown', text: String(record.text ?? ''),
+            ...(record.clientMessageId === undefined ? {} : { clientMessageId: String(record.clientMessageId) }),
+          }
+        : {
+            kind: 'markdown', format: 'markdown', text: String(record.text ?? ''),
+            ...(record.reasoning === undefined || record.reasoning === '' ? {} : { reasoning: String(record.reasoning) }),
+            ...(record.messageId === undefined ? {} : { messageId: String(record.messageId) }),
+            ...(record.provider === undefined ? {} : { provider: String(record.provider) }),
+            ...(record.model === undefined ? {} : { model: String(record.model) }),
+          }
+      break
+    }
+    case 'assistant_activity': {
+      type = 'message'
+      role = 'assistant'
+      status = record.status === 'streaming' ? 'inProgress' : 'done'
+      content = { kind: 'markdown', format: 'markdown', text: String(record.text ?? '') }
+      break
+    }
+    case 'tool': {
+      type = 'tool'
+      role = 'assistant'
+      status = String(record.status ?? 'running')
+      content = {
+        callId: String(record.callId ?? ''),
+        name: String(record.name ?? 'tool'),
+        ...(record.arguments === undefined ? {} : { arguments: record.arguments }),
+        text: String(record.text ?? ''),
+        ...(record.isError === true ? { isError: true } : {}),
+      }
+      break
+    }
+    case 'command': {
+      type = 'marker'
+      role = 'system'
+      status = record.status === 'running' ? 'inProgress' : 'done'
+      content = {
+        kind: 'command',
+        name: String(record.name ?? ''),
+        status: String(record.status ?? 'done'),
+        ...(record.text === undefined ? {} : { text: String(record.text) }),
+      }
+      break
+    }
+    case 'turn_status': {
+      const turnStatus = String(record.status ?? 'running')
+      type = turnStatus === 'running' ? 'turn.start' : 'turn.end'
+      role = 'system'
+      status = 'done'
+      content = type === 'turn.start'
+        ? { kind: 'turn_start', turn: record.turn }
+        : { kind: 'turn_end', turn: record.turn, ...(record.reason === undefined ? {} : { reason: record.reason }) }
+      break
+    }
+    default:
+      type = 'system'
+      role = 'system'
+      status = 'done'
+      content = { kind: 'notice', ...record }
+      break
+  }
+  const canonical = {
+    type,
+    status,
+    role: role ?? null,
+    content,
+  }
+  return {
+    id: item.id,
+    // Wire contract: item.sessionId must be the AA platform session id
+    // (sess_dsh_*); source.sessionId keeps the native DSH session id.
+    sessionId: platformSessionId ?? String(header.id),
+    type,
+    status,
+    role,
+    orderSeq: item.orderSeq,
+    revision: item.revision,
+    // Wire contract (AA connector timeline_content_hash): "sha256:" + hex.
+    // identity.contentHash stays bare hex for internal fingerprints (metadata
+    // records validate /^[a-f0-9]{64}$/), so only the wire projection prefixes.
+    contentHash: `sha256:${contentHash(canonical)}`,
+    content,
+    source: {
+      runtime: 'dsh',
+      sessionId: String(header.id),
+      ...(item.type === 'message' && record.role === 'user' && record.clientMessageId !== undefined
+        ? { clientMessageId: String(record.clientMessageId) }
+        : {}),
+    },
+  } as unknown as TimelineItem
 }
 
 function set(
@@ -252,4 +362,11 @@ function parseToolArguments(value: string): unknown {
   } catch {
     return value
   }
+}
+
+/** Extract the AA clientMessageId from a user-kind message source, if present. */
+function messageSourceClientMessageId(source: SessionEvent extends never ? never : Extract<SessionEvent, { type: 'user/message' }>['data']['source']): string | undefined {
+  if (typeof source !== 'object' || source === null || !('clientMessageId' in source)) return undefined
+  const value = (source as { clientMessageId?: unknown }).clientMessageId
+  return typeof value === 'string' && value.length > 0 ? value : undefined
 }

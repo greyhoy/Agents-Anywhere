@@ -36,7 +36,7 @@ describe('DSH rc.7 plugin manifest', () => {
     })
 
     for (const [name, range] of Object.entries(manifest.peerDependencies)) {
-      if (name.startsWith('@deepseek-ai/dsh-')) expect(range).toBe('>=0.1.0-rc.7 <0.1.0-rc.8')
+      if (name.startsWith('@deepseek-ai/dsh-')) expect(range).toBe('>=0.1.0-rc.7 <0.3.0')
     }
     for (const [name, version] of Object.entries(manifest.devDependencies)) {
       if (name.startsWith('@deepseek-ai/dsh-')) expect(version).toBe('0.1.0-rc.7')

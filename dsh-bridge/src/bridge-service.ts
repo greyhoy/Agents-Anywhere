@@ -153,7 +153,7 @@ export class AgentsAnywhereConnectorService extends TypertRemoteService implemen
     try {
       await this.validateStateRoot()
       await this.metadata.initialize()
-      await this.ctx.sessionPersistence.listSnapshots()
+      await this.ctx.sessionPersistence.list?.() ?? await (this.ctx.sessionPersistence as unknown as { listSnapshots(): Promise<unknown[]> }).listSnapshots()
       const catalogs = new CatalogManager(this.ctx, this.metadata)
       await catalogs.refresh()
       this.catalogs = catalogs
@@ -332,7 +332,7 @@ export class AgentsAnywhereConnectorService extends TypertRemoteService implemen
           signal,
         )
       case 'session.getSnapshot': {
-        const pair = sessionPair(params)
+        const pair = sessionPair(params, platformId => this.sessions?.bindingForPlatform(platformId))
         return await sessions.snapshot(
           pair.sessionId,
           pair.externalSessionId,
@@ -342,31 +342,41 @@ export class AgentsAnywhereConnectorService extends TypertRemoteService implemen
         )
       }
       case 'session.getState': {
-        const pair = sessionPair(params)
+        const pair = sessionPair(params, platformId => this.sessions?.bindingForPlatform(platformId))
         return await sessions.state(pair.sessionId, pair.externalSessionId, signal)
       }
       case 'session.getNotices': {
-        const pair = sessionPair(params)
+        const pair = sessionPair(params, platformId => this.sessions?.bindingForPlatform(platformId))
         return await sessions.notices(pair.sessionId, pair.externalSessionId)
       }
       case 'session.getCapabilities': {
-        const pair = sessionPair(params)
+        const pair = sessionPair(params, platformId => this.sessions?.bindingForPlatform(platformId))
         return await sessions.capabilities(pair.sessionId, pair.externalSessionId, signal)
       }
       case 'session.createAndStart': {
-        const attachments = arrayField(params, 'attachments')
+        // Python connector omits `attachments` when empty and sends `cwd: null`
+        // when unset — treat null/absent as defaults (old-bridge semantics).
+        const rawAttachments = params.attachments
+        if (rawAttachments !== undefined && rawAttachments !== null && !Array.isArray(rawAttachments)) {
+          throw new BridgeError('INVALID_PARAMS', 'attachments must be an array', { retryable: false })
+        }
+        const attachments = (rawAttachments ?? []) as unknown[]
+        const rawCwd = params.cwd
+        if (rawCwd !== undefined && rawCwd !== null && typeof rawCwd !== 'string') {
+          throw new BridgeError('INVALID_PARAMS', 'cwd must be a string when present', { retryable: false })
+        }
         const selections = selectionsField(params)
         return await sessions.createAndStart({
           sessionId: stringField(params, 'sessionId'),
           content: stringField(params, 'content'),
           clientMessageId: stringField(params, 'clientMessageId'),
-          cwd: stringField(params, 'cwd'),
+          cwd: rawCwd ?? process.cwd(),
           attachments,
           ...(selections === undefined ? {} : { selections }),
         }, signal)
       }
       case 'session.startTurn': {
-        const pair = sessionPair(params)
+        const pair = sessionPair(params, platformId => this.sessions?.bindingForPlatform(platformId))
         const selections = selectionsField(params)
         return await sessions.startTurn({
           ...pair,
@@ -376,7 +386,7 @@ export class AgentsAnywhereConnectorService extends TypertRemoteService implemen
         }, signal)
       }
       case 'session.steer': {
-        const pair = sessionPair(params)
+        const pair = sessionPair(params, platformId => this.sessions?.bindingForPlatform(platformId))
         return await sessions.steer({
           ...pair,
           content: stringField(params, 'content'),
@@ -384,15 +394,15 @@ export class AgentsAnywhereConnectorService extends TypertRemoteService implemen
         }, signal)
       }
       case 'session.interrupt': {
-        const pair = sessionPair(params)
+        const pair = sessionPair(params, platformId => this.sessions?.bindingForPlatform(platformId))
         return await sessions.interrupt(pair.sessionId, pair.externalSessionId)
       }
       case 'session.updateSelections': {
-        const pair = sessionPair(params)
+        const pair = sessionPair(params, platformId => this.sessions?.bindingForPlatform(platformId))
         return await sessions.updateSelections(pair.sessionId, pair.externalSessionId, requiredSelections(params), signal)
       }
       case 'session.listCommands': {
-        const pair = sessionPair(params)
+        const pair = sessionPair(params, platformId => this.sessions?.bindingForPlatform(platformId))
         return await sessions.listCommands(
           pair.sessionId,
           pair.externalSessionId,
@@ -402,7 +412,7 @@ export class AgentsAnywhereConnectorService extends TypertRemoteService implemen
         )
       }
       case 'session.executeCommand': {
-        const pair = sessionPair(params)
+        const pair = sessionPair(params, platformId => this.sessions?.bindingForPlatform(platformId))
         return await sessions.executeCommand(
           pair.sessionId,
           pair.externalSessionId,
@@ -413,7 +423,7 @@ export class AgentsAnywhereConnectorService extends TypertRemoteService implemen
         )
       }
       case 'session.respondInteraction': {
-        const pair = sessionPair(params)
+        const pair = sessionPair(params, platformId => this.sessions?.bindingForPlatform(platformId))
         return await sessions.respondInteraction(
           pair.sessionId,
           pair.externalSessionId,
@@ -534,7 +544,7 @@ export class AgentsAnywhereConnectorService extends TypertRemoteService implemen
   private async validateStateRoot(): Promise<void> {
     const location = this.ctx.sessionPersistence.locate({
       version: SESSION_FORMAT_VERSION,
-      id: SessionId('aa-bridge-location-probe'),
+      id: SessionId('aa-bridge-state-root-check'),
       createdAt: 0,
     })
     if (location === undefined) return
@@ -870,11 +880,33 @@ function permissionCatalogPayload(
   }
 }
 
-function sessionPair(params: Record<string, unknown>): { sessionId: string; externalSessionId: string } {
-  return {
-    sessionId: stringField(params, 'sessionId'),
-    externalSessionId: stringField(params, 'externalSessionId'),
+/**
+ * Resolve the (platform, external) session pair from wire params.
+ *
+ * Python callers omit `externalSessionId` when the AA session row has not
+ * learned it yet (e.g. a create attempt failed mid-flight). Fall back to the
+ * durable binding table so read-only operations still resolve the session.
+ */
+function sessionPair(
+  params: Record<string, unknown>,
+  resolveExternal?: (platformSessionId: string) => string | undefined,
+): { sessionId: string; externalSessionId: string } {
+  const sessionId = stringField(params, 'sessionId')
+  const rawExternal = params.externalSessionId
+  if (rawExternal !== undefined && rawExternal !== null) {
+    if (typeof rawExternal !== 'string' || rawExternal.length === 0) {
+      throw new BridgeError('INVALID_PARAMS', 'externalSessionId must be a non-empty string', { retryable: false })
+    }
+    return { sessionId, externalSessionId: rawExternal }
   }
+  const resolved = resolveExternal?.(sessionId)
+  if (resolved === undefined) {
+    throw new BridgeError('SESSION_NOT_FOUND', 'The AA Session has no DSH binding yet.', {
+      retryable: false,
+      sessionId,
+    })
+  }
+  return { sessionId, externalSessionId: resolved }
 }
 
 function selectionsField(params: Record<string, unknown>): RequestedSelections | undefined {

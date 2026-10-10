@@ -536,6 +536,23 @@ class DshRuntime(AgentRuntime):
             await self.host.timeline_item_upsert(
                 models.timeline_item(params.get("item", params))
             )
+        elif method in ("session.state.update", "session.state.updated"):
+            state = models.session_state(params)
+            await self.host.session_state_update(
+                session_id=state.session_id, runtime="dsh",
+                external_session_id=state.external_session_id,
+                status=state.status, selections=state.selections,
+                status_reason=state.status_reason, error=state.error,
+                metadata=state.metadata,
+            )
+        elif method in ("session.meta.upsert", "session.meta.updated"):
+            meta = models.session_meta(params)
+            await self.host.session_meta_upsert(
+                session_id=meta.session_id, runtime="dsh",
+                external_session_id=meta.external_session_id,
+                title=meta.title, cwd=meta.cwd,
+                ordering_time=meta.ordering_time, metadata=meta.metadata,
+            )
         elif method == "runtime.sync.batch" and self._sync is not None:
             self._sync.accept(params)
         elif method == "runtime.error" and self._sync is not None:
