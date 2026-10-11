@@ -683,11 +683,11 @@ class AcpRuntime(AgentRuntime):
         outcome = "completed"
         error_payload: Mapping[str, Any] | None = None
         # Long agent tasks (multi-hour migrations, batch jobs) legitimately
-        # exceed the old 30-minute cap. 4h keeps the two state machines (AA
+        # exceed the old 30-minute cap. 8h keeps the two state machines (AA
         # side + agent side) aligned for realistic workloads; on expiry we
         # explicitly cancel the agent-side turn so the agent does not keep
         # running while AA already considers the turn failed.
-        prompt_timeout = 14400.0
+        prompt_timeout = 28800.0
         try:
             result = await client.request(
                 "session/prompt",
@@ -697,6 +697,17 @@ class AcpRuntime(AgentRuntime):
                 },
                 timeout=prompt_timeout,
             )
+            # Guard: an agent that cannot process the prompt (e.g. session
+            # restore failed on its side) answers with stopReason="refusal"
+            # instead of an error. Treat that as a failed turn so the user
+            # sees an error instead of a silent no-reply.
+            _main_stop = str((result or {}).get("stopReason") or "")
+            if _main_stop == "refusal":
+                raise AcpRpcError(
+                    -32000,
+                    "agent refused the prompt (stopReason=refusal)",
+                    {"details": "session not restorable on agent side"},
+                )
         except TimeoutError:
             # The agent is still processing. Cancel its turn so both sides
             # agree the turn ended; otherwise the agent keeps is_running=True
