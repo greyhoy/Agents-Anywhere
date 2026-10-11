@@ -3,16 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
+import os
+import re
+import tempfile
 import time
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
 
 from connector.runtime_protocol import (
     CAPABILITY_CATALOG_MODEL,
+    CAPABILITY_RUNTIME_ATTACHMENT,
     CAPABILITY_SESSION_INTERACTION_APPROVAL,
     CAPABILITY_SESSION_INTERRUPT,
     CAPABILITY_SESSION_SEND_MESSAGE,
@@ -273,6 +280,20 @@ class AcpRuntime(AgentRuntime):
                     unavailable_reason=None,
                     metadata={"source": "acp.runtime"},
                 ),
+                # Attachments are forwarded as ACP prompt content blocks
+                # (inline images + file:// resource links); hermes acp and
+                # other spec-compliant agents consume both.
+                RuntimeCapability(
+                    capability_id=CAPABILITY_RUNTIME_ATTACHMENT,
+                    scope="session",
+                    runtime=ACP_RUNTIME,
+                    session_id=session_id,
+                    connector_id=self.host.connector_id,
+                    supported=True,
+                    available=True,
+                    unavailable_reason=None,
+                    metadata={"source": "acp.runtime"},
+                ),
             ),
             metadata={"source": "acp.runtime"},
         )
@@ -517,6 +538,7 @@ class AcpRuntime(AgentRuntime):
             session,
             content,
             client_message_id=client_message_id,
+            attachments=attachments,
         )
 
     async def start_turn(
@@ -547,6 +569,7 @@ class AcpRuntime(AgentRuntime):
             session,
             content,
             client_message_id=client_message_id,
+            attachments=attachments,
         )
 
     async def interrupt_session(
@@ -568,11 +591,15 @@ class AcpRuntime(AgentRuntime):
                 code="acp_not_connected",
                 message="ACP agent is not running",
             )
+        # ACP v0.11.2 defines session/cancel as a *notification* (no response).
+        # Sending it as a request makes spec-compliant agents (hermes acp,
+        # openclaw acp) answer -32601 Method not found, which surfaced as
+        # acp_cancel_failed and left the turn running. Fire-and-forget notify
+        # matches the protocol and the reference client implementation.
         try:
-            await client.request(
+            await client.notify(
                 "session/cancel",
                 {"sessionId": session.external_session_id},
-                timeout=30,
             )
         except Exception as exc:
             return RuntimeOperationResult(
@@ -625,11 +652,87 @@ class AcpRuntime(AgentRuntime):
         future.set_result(outcome)
         return RuntimeOperationResult(ok=True)
 
+    # ------------------------------------------------------ attachments
+
+    _TEXTUAL_MIME_PREFIXES = ("text/", "application/json", "application/xml")
+    _TEXTUAL_MIME_SUFFIXES = (
+        ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".yaml", ".yml",
+        ".xml", ".log", ".ini", ".toml", ".py", ".js", ".ts", ".sh", ".html",
+        ".css", ".sql",
+    )
+
+    def _attachment_is_textual(self, media_type: str | None, name: str | None) -> bool:
+        mime = (media_type or "").split(";", 1)[0].strip().lower()
+        if mime.startswith(self._TEXTUAL_MIME_PREFIXES):
+            return True
+        if mime.startswith("image/"):
+            return False
+        suffix = Path(name or "").suffix.lower()
+        return suffix in self._TEXTUAL_MIME_SUFFIXES
+
+    async def _prepare_prompt_blocks(
+        self,
+        session: AcpSession,
+        content: str,
+        attachments: tuple[RuntimeAttachment, ...],
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Build ACP prompt content blocks from text + uploaded attachments.
+
+        Images are sent inline as base64 ImageContentBlock; textual files are
+        staged to a private temp dir and referenced via file:// resource_link
+        (hermes acp reads those into the prompt). Non-textual non-image files
+        are referenced by resource_link so the agent at least sees a named
+        placeholder. Returns (blocks, cleanup_paths).
+        """
+        blocks: list[dict[str, Any]] = [{"type": "text", "text": content}]
+        cleanup_paths: list[str] = []
+        if not attachments:
+            return blocks, cleanup_paths
+        staging = Path(tempfile.gettempdir()) / "aa-acp-attachments" / session.session_id
+        staging.mkdir(parents=True, exist_ok=True)
+        for attachment in attachments:
+            try:
+                downloaded = await self.host.attachment_download(
+                    session.session_id, attachment.file_id
+                )
+            except Exception:
+                logger.exception(
+                    "ACP attachment download failed file_id={}", attachment.file_id
+                )
+                blocks.append({
+                    "type": "text",
+                    "text": f"[Attachment '{attachment.name or attachment.file_id}' could not be loaded]",
+                })
+                continue
+            name = attachment.name or downloaded.name or attachment.file_id
+            media_type = (attachment.media_type or downloaded.media_type or "application/octet-stream").split(";", 1)[0]
+            if media_type.startswith("image/"):
+                blocks.append({
+                    "type": "image",
+                    "data": base64.b64encode(downloaded.content).decode("ascii"),
+                    "mimeType": media_type,
+                })
+                continue
+            # Stage the file so the agent can read it via file:// URI.
+            safe_name = re.sub(r"[^\w.-]+", "_", name)[:120] or "attachment"
+            staged_path = staging / f"{uuid.uuid4().hex[:8]}-{safe_name}"
+            staged_path.write_bytes(downloaded.content)
+            os.chmod(staged_path, 0o600)
+            cleanup_paths.append(str(staged_path))
+            blocks.append({
+                "type": "resource_link",
+                "uri": staged_path.as_uri(),
+                "name": name,
+                "mimeType": media_type,
+            })
+        return blocks, cleanup_paths
+
     async def _run_turn(
         self,
         session: AcpSession,
         content: str,
         client_message_id: str | None = None,
+        attachments: tuple[RuntimeAttachment, ...] = (),
     ) -> RuntimeOperationResult:
         session.turn_seq += 1
         turn_id = f"acp-turn-{session.turn_seq}"
@@ -668,8 +771,11 @@ class AcpRuntime(AgentRuntime):
 
         client = self._client
         assert client is not None
+        prompt_blocks, cleanup_paths = await self._prepare_prompt_blocks(
+            session, content, attachments
+        )
         asyncio.create_task(
-            self._drive_turn(session, turn_id, content, client)
+            self._drive_turn(session, turn_id, prompt_blocks, content, client, cleanup_paths)
         )
         return RuntimeOperationResult(ok=True, result={"turnId": turn_id})
 
@@ -677,8 +783,10 @@ class AcpRuntime(AgentRuntime):
         self,
         session: AcpSession,
         turn_id: str,
+        prompt_blocks: list[dict[str, Any]],
         content: str,
         client: AcpClient,
+        cleanup_paths: list[str],
     ) -> None:
         outcome = "completed"
         error_payload: Mapping[str, Any] | None = None
@@ -693,7 +801,7 @@ class AcpRuntime(AgentRuntime):
                 "session/prompt",
                 {
                     "sessionId": session.external_session_id,
-                    "prompt": [{"type": "text", "text": content}],
+                    "prompt": prompt_blocks,
                 },
                 timeout=prompt_timeout,
             )
@@ -713,10 +821,9 @@ class AcpRuntime(AgentRuntime):
             # agree the turn ended; otherwise the agent keeps is_running=True
             # and silently queues any follow-up messages.
             try:
-                await client.request(
+                await client.notify(
                     "session/cancel",
                     {"sessionId": session.external_session_id},
-                    timeout=30,
                 )
             except Exception:
                 logger.exception(
@@ -786,6 +893,11 @@ class AcpRuntime(AgentRuntime):
                 "message": str(exc)[:500],
             }
         finally:
+            for path_str in cleanup_paths:
+                try:
+                    Path(path_str).unlink(missing_ok=True)
+                except Exception:
+                    logger.debug("ACP attachment cleanup failed: {}", path_str)
             await self._finalize_turn_items(session, turn_id, outcome)
             session.active_turn_id = None
             await self.host.session_turn_ended(

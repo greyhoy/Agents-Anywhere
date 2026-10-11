@@ -80,7 +80,10 @@ def acp_capabilities() -> dict[str, bool]:
         "interruptTurn": True,
         "commands": False,
         "interactions": True,
-        "attachments": False,
+        # hermes acp declares PromptCapabilities(image=True) and converts
+        # image/resource_link/embedded-resource blocks to OpenAI content
+        # parts, so the ACP runtime can forward uploaded attachments.
+        "attachments": True,
         "ipc": False,
     }
 
