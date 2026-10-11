@@ -225,6 +225,10 @@ class AcpRuntime(AgentRuntime):
                 cap(CAPABILITY_SESSION_SEND_MESSAGE),
                 cap(CAPABILITY_SESSION_INTERRUPT),
                 cap(CAPABILITY_SESSION_INTERACTION_APPROVAL),
+                # Attachments are forwarded as ACP prompt content blocks
+                # (inline images + file:// resource links); hermes acp and
+                # other spec-compliant agents consume both.
+                cap(CAPABILITY_RUNTIME_ATTACHMENT),
                 cap(CAPABILITY_CATALOG_MODEL, False),
             ),
             metadata={"source": "acp.runtime"},
