@@ -153,6 +153,23 @@ def permission_catalog(value: Any) -> RuntimePermissionCatalog:
 
 def session_meta(value: Any, *, session_id: str | None = None) -> SessionMeta:
     data = _mapping(value, "session meta")
+    metadata = _dict(data.get("metadata"))
+    # The bridge reports timeline backfill demand on the meta top level
+    # (requiresTimelineSync/revision), but the scanner contract shared with the
+    # Claude and Codex readers reads metadata.sync. Fold the top-level facts
+    # into metadata.sync so history backfill is actually triggered; without
+    # this the DSH timeline never syncs and old sessions show no history.
+    requires_timeline_sync = data.get("requiresTimelineSync")
+    revision = data.get("revision")
+    if isinstance(requires_timeline_sync, bool) or isinstance(revision, str):
+        sync = dict(metadata.get("sync")) if isinstance(
+            metadata.get("sync"), dict
+        ) else {}
+        if isinstance(requires_timeline_sync, bool):
+            sync["requires_timeline_sync"] = requires_timeline_sync
+        if isinstance(revision, str):
+            sync["marker"] = revision
+        metadata["sync"] = sync
     return SessionMeta(
         session_id=session_id or _required_string(data.get("sessionId"), "sessionId"),
         external_session_id=_required_string(
@@ -164,7 +181,7 @@ def session_meta(value: Any, *, session_id: str | None = None) -> SessionMeta:
         ordering_time=_optional_string(
             data.get("orderingTime") or data.get("lastActivityAt")
         ),
-        metadata=_dict(data.get("metadata")),
+        metadata=metadata,
     )
 
 

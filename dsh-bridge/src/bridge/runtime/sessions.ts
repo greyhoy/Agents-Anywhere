@@ -419,6 +419,7 @@ export class SessionManager {
     const controller = await this.writableController(operation.sessionId, operation.externalSessionId, signal)
     return await controller.enqueue(async () => {
       await this.checkRevision(controller, signal)
+      await this.ensureUnarchived(controller)
       const agent = await this.resume(controller, signal)
       if (agent.status !== 'idle' || controller.status !== 'idle') throw sessionConflict(controller, 'start a turn')
       await this.applySelections(controller, operation.selections)
@@ -447,6 +448,7 @@ export class SessionManager {
     const controller = await this.writableController(operation.sessionId, operation.externalSessionId, signal)
     return await controller.enqueue(async () => {
       await this.checkRevision(controller, signal)
+      await this.ensureUnarchived(controller)
       const agent = controller.requireLive(id => this.ctx.agents.get(id))
       if (agent.status !== 'running' || controller.status !== 'running') throw sessionConflict(controller, 'steer')
       const result = await this.submitMessage(controller, 'steer', operation.content, operation.clientMessageId, true)
@@ -1221,6 +1223,39 @@ export class SessionManager {
 
   private archivedSessionIds(): ReadonlySet<SessionId> {
     return new Set(this.ctx.workspaceRegistry.archivedSessionIds)
+  }
+
+  /**
+   * Lift the DSH workspace archive gate before a write turn. DSH's
+   * archived-session gate rejects `agent/pre-step` for archived Sessions, so
+   * an AA takeover message would be silently dropped. A write intent is an
+   * explicit unarchive: restore the Session first (feature-detected, since
+   * `unarchiveSession` only exists on dsh-workspace >= 0.2.0 hosts), then
+   * report the restored visibility to the Connector. Hosts without the
+   * method get a visible `SESSION_ARCHIVED` error instead of silence.
+   */
+  private async ensureUnarchived(controller: SessionController): Promise<void> {
+    const externalSessionId = controller.externalSessionId
+    if (externalSessionId === undefined || !this.archivedSessionIds().has(SessionId(String(externalSessionId)))) return
+    const registry = this.ctx.workspaceRegistry as unknown as {
+      unarchiveSession?: (id: SessionId) => Promise<void>
+    }
+    if (typeof registry.unarchiveSession !== 'function') {
+      throw new BridgeError('SESSION_ARCHIVED', 'The DSH Session is archived in the workspace; unarchive it in DSH first.', {
+        retryable: false,
+        ...(controller.platformSessionId === undefined ? {} : { sessionId: controller.platformSessionId }),
+        externalSessionId: String(externalSessionId),
+      })
+    }
+    await registry.unarchiveSession(SessionId(String(externalSessionId)))
+    const snapshot = (await this.listSnapshotsCompat())
+      .find(item => String(item.header.id) === String(externalSessionId))
+    if (snapshot !== undefined) {
+      await this.emit(
+        'session.meta.upsert',
+        await this.metaFor(snapshot, this.archivedSessionIds()) as unknown as Record<string, unknown>,
+      )
+    }
   }
 
   private async publishEvent(

@@ -577,9 +577,15 @@ def _inventory_source_state(session: SessionMeta) -> str | dict[str, Any]:
     if any(
         metadata.get(key) is True
         for key in (
-            "hidden",
             "localArchived",
             "local_archived",
+        )
+    ):
+        return "archived"
+    if any(
+        metadata.get(key) is True
+        for key in (
+            "hidden",
             "localDeleted",
             "local_deleted",
         )

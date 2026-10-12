@@ -1364,9 +1364,9 @@ def _dsh_session_meta_source_state(params: dict[str, Any]) -> str:
     )
     if local_state == "deleted":
         return "missing"
-    if _bool_param(params, metadata, ("hidden",)):
-        return "hidden"
     if _bool_param(params, metadata, ("localArchived", "local_archived")):
+        return "archived"
+    if _bool_param(params, metadata, ("hidden",)):
         return "hidden"
     if params.get("resumeSupported") is False or params.get("resumable") is False:
         return "hidden"

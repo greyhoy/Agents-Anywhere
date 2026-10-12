@@ -21,6 +21,7 @@ export type BridgeErrorCode =
   | 'FRAME_TOO_LARGE'
   | 'DSH_CONCURRENT_WRITER_DETECTED'
   | 'COMMAND_NOT_FOUND'
+  | 'SESSION_ARCHIVED'
 
 const JSON_RPC_CODES: Readonly<Record<BridgeErrorCode, number>> = {
   PARSE_ERROR: -32700,
@@ -44,6 +45,7 @@ const JSON_RPC_CODES: Readonly<Record<BridgeErrorCode, number>> = {
   NOT_INITIALIZED: -32012,
   FRAME_TOO_LARGE: -32013,
   COMMAND_NOT_FOUND: -32014,
+  SESSION_ARCHIVED: -32015,
 }
 
 /** Safe optional error metadata exposed across the process boundary. */

@@ -1591,7 +1591,7 @@ async def _exercise_runtime_sync_reconciles_complete_dsh_inventory_only() -> Non
             {
                 "sessionId": "sess_dsh_hidden",
                 "externalSessionId": "dsh-hidden",
-                "sourceState": "hidden",
+                "sourceState": "archived",
             },
         ],
     }

@@ -7355,7 +7355,7 @@ def test_session_inventory_does_not_overwrite_newer_source_event(tmp_path):
     assert session["sourceObservationOrigin"] == "event"
 
 
-def test_connector_ingest_dsh_hidden_state_is_reversible_without_archiving(tmp_path):
+def test_connector_ingest_dsh_archived_state_archives_and_stays_reversible(tmp_path):
     client = make_client(tmp_path)
     _, access_token, _, headers = create_connector_and_session(client)
     connector_headers = {"Authorization": f"Bearer {access_token}"}
@@ -7383,11 +7383,13 @@ def test_connector_ingest_dsh_hidden_state_is_reversible_without_archiving(tmp_p
     assert hidden.status_code == 200, hidden.text
     hidden_snapshot = client.get("/sessions/sess_dsh_hidden/snapshot", headers=headers)
     assert hidden_snapshot.status_code == 200, hidden_snapshot.text
-    assert hidden_snapshot.json()["session"]["archived"] is False
+    assert hidden_snapshot.json()["session"]["archived"] is True
+    assert hidden_snapshot.json()["session"]["sourceAvailability"] == "archived"
     listed_ids = {
         session.id
         for session in asyncio.run(
             client.app.state.store.list_sessions(
+                archived=True,
                 user_id=account_user_id(client),
             )
         )
@@ -7417,11 +7419,13 @@ def test_connector_ingest_dsh_hidden_state_is_reversible_without_archiving(tmp_p
     assert visible.status_code == 200, visible.text
     visible_snapshot = client.get("/sessions/sess_dsh_hidden/snapshot", headers=headers)
     assert visible_snapshot.status_code == 200, visible_snapshot.text
-    assert visible_snapshot.json()["session"]["archived"] is False
+    assert visible_snapshot.json()["session"]["archived"] is True
+    assert visible_snapshot.json()["session"]["sourceAvailability"] == "available"
     listed_ids = {
         session.id
         for session in asyncio.run(
             client.app.state.store.list_sessions(
+                archived=True,
                 user_id=account_user_id(client),
             )
         )
