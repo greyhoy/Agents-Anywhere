@@ -6,6 +6,16 @@ const RUNTIME_CAPABILITIES = [
   'catalog.model',
   'catalog.permission',
   'catalog.effort',
+  // Session operations the bridge implements regardless of Session state.
+  // The connector derives startTurn/interruptTurn/commands from these ids
+  // (dsh_capabilities in provider_config.py) and the server inherits them
+  // for sessions without session-scoped capability rows (idle synced
+  // sessions). Without this declaration DSH is permanently readOnly.
+  'session.send_message',
+  'session.interrupt',
+  'session.steer',
+  'session.commands',
+  'session.interaction.approval',
 ] as const
 
 const SESSION_CAPABILITIES = [
